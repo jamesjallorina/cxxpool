@@ -298,7 +298,7 @@ class thread_pool {
     task_counter_;
   std::atomic<std::size_t> task_balance_;
   std::condition_variable task_cond_var_;
-  std::mutex task_mutex_;
+  mutable std::mutex task_mutex_;
   mutable std::condition_variable wait_cond_var_;
   mutable std::mutex wait_mutex_;
   mutable std::mutex thread_mutex_;
@@ -320,7 +320,7 @@ inline
 thread_pool::thread_pool()
 : done_{false}, threads_{}, tasks_{}, task_counter_{}, task_balance_{0},
   task_cond_var_{}, task_mutex_{}, wait_cond_var_{}, wait_mutex_{},
-  thread_mutex_{}, threads_to_remove_{0}, remove_thread_{}, remove_cond_var_{}
+  thread_mutex_{}, threads_to_remove_{}, remove_thread_{}, remove_cond_var_{}
 {
   const auto n_threads = std::thread::hardware_concurrency();
   if (n_threads == 0)
@@ -332,7 +332,7 @@ inline
 thread_pool::thread_pool(std::size_t n_threads)
 : done_{false}, threads_{}, tasks_{}, task_counter_{}, task_balance_{0},
   task_cond_var_{}, task_mutex_{}, wait_cond_var_{}, wait_mutex_{},
-  thread_mutex_{}, threads_to_remove_{0}, remove_thread_{}, remove_cond_var_{}
+  thread_mutex_{}, threads_to_remove_{}, remove_thread_{}, remove_cond_var_{}
 {
   add_threads(n_threads);
 }
@@ -391,6 +391,11 @@ void thread_pool::remove_threads(std::size_t n_threads) {
 
 inline
 std::size_t thread_pool::n_threads() const {
+  {
+    std::lock_guard<std::mutex> task_lock{task_mutex_};
+    if (done_)
+      throw thread_pool_error{"n_threads called while pool is shutting down"};
+  }
   std::lock_guard<std::mutex> thread_lock{thread_mutex_};
   return threads_.size();
 }
@@ -411,11 +416,11 @@ auto thread_pool::push(std::size_t priority, Functor&& functor, Args&&... args)
     std::bind(std::forward<Functor>(functor), std::forward<Args>(args)...));
   auto future = pack_task->get_future();
   {
-      std::lock_guard<std::mutex> lock{task_mutex_};
-      if (done_)
-        throw thread_pool_error{"push called while pool is shutting down"};
-      ++task_counter_; ++task_balance_;
-      tasks_.emplace([pack_task]{ (*pack_task)(); }, priority, task_counter_);
+    std::lock_guard<std::mutex> lock{task_mutex_};
+    if (done_)
+      throw thread_pool_error{"push called while pool is shutting down"};
+    ++task_counter_; ++task_balance_;
+    tasks_.emplace([pack_task]{ (*pack_task)(); }, priority, task_counter_);
   }
   task_cond_var_.notify_one();
   return future;
@@ -459,8 +464,12 @@ void thread_pool::worker(std::shared_ptr<std::atomic<bool>> done) {
       task_cond_var_.wait(lock, [this]{
         return done_ || !tasks_.empty() || threads_to_remove_ > 0;
       });
-      if ((done_ && tasks_.empty()) || threads_to_remove_ > 0)
-          break;
+      if (done_) {
+        break;
+      } else if (threads_to_remove_ > 0) {
+        --threads_to_remove_;
+        break;
+      }
       task = tasks_.top();
       tasks_.pop();
     }
@@ -475,21 +484,21 @@ void thread_pool::worker(std::shared_ptr<std::atomic<bool>> done) {
 inline
 void thread_pool::remover() {
   for (;;) {
-    std::unique_lock<std::mutex> task_lock{task_mutex_};
+    std::lock(task_mutex_, thread_mutex_);
+    std::unique_lock<std::mutex> task_lock{task_mutex_, std::adopt_lock};
+    std::unique_lock<std::mutex> thread_lock{thread_mutex_, std::adopt_lock};
     remove_cond_var_.wait(task_lock, [this]{
-      return done_ || threads_to_remove_ > 0;
+      return done_;
     });
     if (done_)
       break;
-    std::lock_guard<std::mutex> thread_lock{thread_mutex_};
     for (auto it=threads_.begin(); it != threads_.cend();) {
-        if (it->done->load()) {
-            it->handle.join();
-            threads_.erase(it++);
-            --threads_to_remove_;
-        } else {
-            ++it;
-        }
+      if (it->done->load()) {
+        it->handle.join();
+        threads_.erase(it++);
+      } else {
+        ++it;
+      }
     }
   }
 }
